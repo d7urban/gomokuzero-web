@@ -592,6 +592,7 @@ document.addEventListener('keydown', e => {
 // Board drawing
 // ---------------------------------------------------------------------------
 function draw() {
+  if (board.length === 0) return;
   const sz = canvas.width;
   const margin = sz * 0.05;
   const cell = (sz - 2 * margin) / (N - 1);
