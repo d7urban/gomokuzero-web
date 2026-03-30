@@ -1,18 +1,13 @@
 #!/usr/bin/env python3
-"""Gomoku - Play with a Web UI.
+"""GomokuZero Web — stateless API for Vercel deployment.
 
-Human-vs-AI, Human-vs-Human, continuous analysis heatmap, undo,
-save/load, difficulty and side selection.
-
-Uses TFLite for inference (no full TensorFlow dependency).
-
-Requires: pip install flask numpy ai-edge-litert
+All game state lives on the client.  The server provides two compute
+endpoints (AI move and analysis) plus serves the static HTML.
 """
 
 import os
 import sys
 import threading
-import time
 
 import numpy as np
 
@@ -24,57 +19,31 @@ except ImportError:
 
 from gomoku import (
     BOARD_SIZE,
-    EMPTY,
-    PLAYER1,
-    PLAYER2,
-    WIN_LENGTH,
     GomokuGame,
-    mcts_begin,
-    mcts_expand_root,
-    mcts_policy,
-    mcts_process_results,
     mcts_search_batched,
-    mcts_select_leaves,
+    mcts_policy,
 )
 
 # ---------------------------------------------------------------------------
-# Constants
+# TFLite model (loaded once per cold start)
 # ---------------------------------------------------------------------------
 
 MODEL_FILE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "gomoku_best.tflite"
 )
-
-AI_SIMULATIONS = 500
-AI_MCTS_BATCH = 32
-DIFFICULTY_SIMS = {
-    "easy": 250,
-    "medium": 500,
-    "hard": 2000,
-}
-ANALYSIS_MAX_SIMS = 1_000_000
-ANALYSIS_EMIT_INTERVAL_SEC = 0.2
+MCTS_BATCH = 32
+MAX_SIMS = 5000
 
 
-# ---------------------------------------------------------------------------
-# TFLite inference
-# ---------------------------------------------------------------------------
-
-def make_tflite_predict_fn(model_path):
-    """Load a .tflite model and return a batched predict function.
-
-    Returns predict_fn(batch_np) -> (logits, values) with the same
-    signature as the TF-based make_predict_fn in gomoku.py.
-    """
+def _load_model():
     from ai_edge_litert.interpreter import Interpreter
 
-    interp = Interpreter(model_path=model_path)
+    interp = Interpreter(model_path=MODEL_FILE)
     interp.allocate_tensors()
-    inp_detail = interp.get_input_details()[0]
-    out_details = interp.get_output_details()
+    inp = interp.get_input_details()[0]
+    outs = interp.get_output_details()
 
-    # Identify which output is logits (225) vs value (1) by shape.
-    if out_details[0]["shape"][-1] == BOARD_SIZE * BOARD_SIZE:
+    if outs[0]["shape"][-1] == BOARD_SIZE * BOARD_SIZE:
         logits_idx, value_idx = 0, 1
     else:
         logits_idx, value_idx = 1, 0
@@ -84,15 +53,14 @@ def make_tflite_predict_fn(model_path):
     def predict_fn(batch):
         batch = np.asarray(batch, dtype=np.float32)
         with lock:
-            interp.resize_tensor_input(inp_detail["index"], batch.shape)
+            interp.resize_tensor_input(inp["index"], batch.shape)
             interp.allocate_tensors()
-            interp.set_tensor(inp_detail["index"], batch)
+            interp.set_tensor(inp["index"], batch)
             interp.invoke()
-            logits = interp.get_tensor(out_details[logits_idx]["index"])
-            values = interp.get_tensor(out_details[value_idx]["index"])
+            logits = interp.get_tensor(outs[logits_idx]["index"])
+            values = interp.get_tensor(outs[value_idx]["index"])
         return logits.copy(), values.copy()
 
-    # Warmup.
     from gomoku import NUM_INPUT_PLANES
     predict_fn(
         np.zeros((1, BOARD_SIZE, BOARD_SIZE, NUM_INPUT_PLANES),
@@ -101,46 +69,22 @@ def make_tflite_predict_fn(model_path):
     return predict_fn
 
 
+predict_fn = _load_model()
+
 # ---------------------------------------------------------------------------
-# Helpers (inlined from entrypoint_shared)
+# Helpers
 # ---------------------------------------------------------------------------
 
-class AIPlayer:
-    """AI that selects moves via MCTS backed by a trained network."""
 
-    def __init__(self, predict_fn, simulations=AI_SIMULATIONS,
-                 difficulty="medium"):
-        self.predict_fn = predict_fn
-        self.sims = simulations
-        self.difficulty = difficulty
-
-    def get_move(self, game):
-        root = mcts_search_batched(
-            game, self.predict_fn,
-            num_simulations=self.sims,
-            batch_size=AI_MCTS_BATCH,
-            c_puct=1.5,
-            add_noise=False,
-        )
-        pi = mcts_policy(root, temperature=0.05)
-        idx = int(np.argmax(pi))
-        row, col = divmod(idx, BOARD_SIZE)
-        return row, col, root.q_value
-
-
-def resolve_difficulty(value):
-    key = (value or "").strip().lower()
-    if key in DIFFICULTY_SIMS:
-        return key, DIFFICULTY_SIMS[key]
-    try:
-        sims = int(value)
-    except (TypeError, ValueError) as err:
-        raise ValueError(
-            "Invalid difficulty. Use easy|medium|hard or a positive integer."
-        ) from err
-    if sims <= 0:
-        raise ValueError("Custom difficulty sims must be a positive integer.")
-    return "Custom", sims
+def _reconstruct_game(move_history):
+    """Replay a move list [[r,c], ...] into a GomokuGame."""
+    game = GomokuGame()
+    for move in move_history:
+        r, c = int(move[0]), int(move[1])
+        reward, done = game.make_move(r, c)
+        if reward == -1:
+            raise ValueError(f"Illegal move ({r},{c}) in history")
+    return game
 
 
 # ---------------------------------------------------------------------------
@@ -150,618 +94,95 @@ def resolve_difficulty(value):
 app = Flask(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Analysis worker (background MCTS pondering)
-# ---------------------------------------------------------------------------
-
-class AnalysisWorker(threading.Thread):
-    """Background MCTS pondering thread."""
-
-    def __init__(self, session_id, predict_fn, game,
-                 batch_size=AI_MCTS_BATCH, c_puct=1.5,
-                 max_sims=ANALYSIS_MAX_SIMS):
-        super().__init__(daemon=True)
-        self.session_id = session_id
-        self.predict_fn = predict_fn
-        self.game = game.copy()
-        self.batch_size = batch_size
-        self.c_puct = c_puct
-        self.max_sims = max_sims
-        self._running = True
-        self._lock = threading.Lock()
-        self.policy = None
-        self.q_vals = None
-        self.root_q = 0.0
-        self.sims_done = 0
-
-    def stop(self):
-        self._running = False
-
-    def get_snapshot(self):
-        with self._lock:
-            if self.policy is None:
-                return None, None, 0.0, 0
-            return (self.policy.copy(), self.q_vals.copy(),
-                    self.root_q, self.sims_done)
-
-    def _update_snapshot(self, ctx):
-        root = ctx["root"]
-        counts = np.zeros(BOARD_SIZE * BOARD_SIZE, dtype=np.float32)
-        q_vals = np.full(BOARD_SIZE * BOARD_SIZE, np.nan, dtype=np.float32)
-        for (r, c), child in root.children.items():
-            counts[r * BOARD_SIZE + c] = child.visit_count
-            if child.visit_count:
-                q_vals[r * BOARD_SIZE + c] = -child.q_value
-        with self._lock:
-            self.policy = counts
-            self.q_vals = q_vals
-            self.root_q = float(root.q_value)
-            self.sims_done = int(ctx["sims_done"])
-
-    def run(self):
-        try:
-            ctx, root_state = mcts_begin(
-                self.game, num_simulations=self.max_sims,
-                batch_size=self.batch_size, c_puct=self.c_puct,
-                add_noise=False,
-            )
-            root_batch = np.array([root_state], dtype=np.float32)
-            logits_np, values_np = self.predict_fn(root_batch)
-            mcts_expand_root(ctx, logits_np[0], values_np.ravel()[0])
-
-            last_emit = 0.0
-            while self._running and ctx["sims_done"] < ctx["sims_target"]:
-                leaf_states = mcts_select_leaves(ctx)
-                if leaf_states:
-                    batch = np.array(leaf_states, dtype=np.float32)
-                    l_np, v_np = self.predict_fn(batch)
-                    mcts_process_results(ctx, l_np, v_np.ravel())
-                else:
-                    mcts_process_results(ctx)
-                now = time.time()
-                if now - last_emit >= ANALYSIS_EMIT_INTERVAL_SEC:
-                    self._update_snapshot(ctx)
-                    last_emit = now
-
-            self._update_snapshot(ctx)
-        except Exception as e:
-            print(f"Analysis worker error: {e}", file=sys.stderr)
-
-
-# ---------------------------------------------------------------------------
-# Game server (single-session state + thread management)
-# ---------------------------------------------------------------------------
-
-class GameServer:
-    def __init__(self):
-        self.lock = threading.Lock()
-        self.game = GomokuGame()
-
-        print(f"  Loading model: {MODEL_FILE}")
-        self.predict_fn = make_tflite_predict_fn(MODEL_FILE)
-        self.ai = AIPlayer(
-            self.predict_fn,
-            simulations=AI_SIMULATIONS,
-            difficulty="medium",
-        )
-
-        self.human_player = PLAYER1
-        self.human_only_mode = False
-        self.game_over = False
-        self.human_turn = True
-        self.message = "Your turn (Black)."
-        self.difficulty_label = "medium"
-        self.difficulty_sims = AI_SIMULATIONS
-
-        self.analysis_enabled = False
-        self.analysis_worker = None
-        self.analysis_session_id = 0
-        self.analysis_started_at = 0.0
-
-        self.ai_thinking = False
-        self._ai_turn_gen = 0
-
-    # -- State snapshot for the client --
-
-    def get_state(self):
-        with self.lock:
-            last_move = None
-            if self.game.move_history:
-                lm = self.game.move_history[-1]
-                last_move = [int(lm[0]), int(lm[1])]
-
-            winning = self._winning_line_cells()
-
-            out = {
-                "board": self.game.board.tolist(),
-                "board_size": int(BOARD_SIZE),
-                "current_player": int(self.game.current_player),
-                "human_player": int(self.human_player),
-                "human_turn": bool(self.human_turn),
-                "game_over": bool(self.game_over),
-                "human_only_mode": bool(self.human_only_mode),
-                "message": self.message,
-                "move_count": len(self.game.move_history),
-                "last_move": last_move,
-                "winning_cells": [list(c) for c in winning],
-                "difficulty": f"{self.difficulty_label} ({self.difficulty_sims} sims)",
-                "ai_thinking": bool(self.ai_thinking),
-                "analysis_enabled": bool(self.analysis_enabled),
-                "analysis": None,
-            }
-
-            if self.analysis_enabled and self.analysis_worker is not None:
-                policy, q_vals, root_q, sims_done = \
-                    self.analysis_worker.get_snapshot()
-                if policy is not None:
-                    elapsed = max(1e-9, time.time() - self.analysis_started_at)
-                    sps = sims_done / elapsed if sims_done > 0 else 0
-                    q_list = [
-                        None if np.isnan(v) else round(float(v), 4)
-                        for v in q_vals
-                    ]
-                    out["analysis"] = {
-                        "policy": [round(float(v), 1) for v in policy],
-                        "q_vals": q_list,
-                        "root_q": round(root_q, 4),
-                        "sims_done": sims_done,
-                        "sims_per_sec": round(sps, 1),
-                    }
-            return out
-
-    def _winning_line_cells(self):
-        if not self.game_over or not self.game.move_history:
-            return []
-        row, col, player = self.game.move_history[-1]
-        row, col, player = int(row), int(col), int(player)
-        if not (0 <= row < BOARD_SIZE and 0 <= col < BOARD_SIZE):
-            return []
-        if int(self.game.board[row, col]) != player:
-            return []
-        for dr, dc in ((0, 1), (1, 0), (1, 1), (1, -1)):
-            cells = [(row, col)]
-            rr, cc = row + dr, col + dc
-            while (0 <= rr < BOARD_SIZE and 0 <= cc < BOARD_SIZE
-                   and int(self.game.board[rr, cc]) == player):
-                cells.append((rr, cc))
-                rr += dr
-                cc += dc
-            rr, cc = row - dr, col - dc
-            while (0 <= rr < BOARD_SIZE and 0 <= cc < BOARD_SIZE
-                   and int(self.game.board[rr, cc]) == player):
-                cells.insert(0, (rr, cc))
-                rr -= dr
-                cc -= dc
-            if len(cells) >= WIN_LENGTH:
-                return cells
-        return []
-
-    # -- Game actions --
-
-    def new_game(self, side=None, mode=None):
-        with self.lock:
-            self._stop_analysis()
-            self._ai_turn_gen += 1
-            self.ai_thinking = False
-
-            if mode == "human":
-                self.human_only_mode = True
-            elif mode == "ai":
-                self.human_only_mode = False
-
-            self.game = GomokuGame()
-            self.game_over = False
-
-            if self.human_only_mode:
-                self.human_player = PLAYER1
-                self.human_turn = True
-                self.message = "New game (Human vs Human). Black plays first."
-            else:
-                self.human_player = (
-                    PLAYER1 if side != "ai_first" else PLAYER2
-                )
-                self.human_turn = (
-                    self.game.current_player == self.human_player
-                )
-                if not self.human_turn:
-                    self.message = "New game. AI goes first..."
-                    self._begin_ai_turn()
-                    return {"ok": True}
-                self.message = "New game. Your turn (Black)."
-
-            self._restart_analysis()
-            return {"ok": True}
-
-    def make_move(self, row, col):
-        with self.lock:
-            if self.game_over:
-                return {"error": "Game is over."}
-            if self.ai_thinking:
-                return {"error": "Wait for AI to finish."}
-            if not self.human_only_mode and not self.human_turn:
-                return {"error": "Not your turn."}
-            if not (0 <= row < BOARD_SIZE and 0 <= col < BOARD_SIZE):
-                return {"error": "Out of bounds."}
-            if self.game.board[row, col] != EMPTY:
-                return {"error": "Cell is occupied."}
-
-            self._stop_analysis()
-            reward, done = self.game.make_move(row, col)
-
-            if done:
-                self.game_over = True
-                if reward == 1:
-                    if self.human_only_mode:
-                        w = ("Black" if self.game.current_player == PLAYER1
-                             else "White")
-                        self.message = f"{w} wins!"
-                    else:
-                        self.message = "You win!"
-                else:
-                    self.message = "Draw!"
-                return {"ok": True}
-
-            if self.human_only_mode:
-                side = ("Black" if self.game.current_player == PLAYER1
-                        else "White")
-                self.message = f"{side} to play."
-                self._restart_analysis()
-                return {"ok": True}
-
-            self.human_turn = False
-            self.message = f"You played ({row},{col}). AI thinking..."
-            self._begin_ai_turn()
-            return {"ok": True}
-
-    def undo(self):
-        with self.lock:
-            if self.ai_thinking:
-                return {"error": "Wait for AI to finish."}
-
-            self._stop_analysis()
-
-            if self.human_only_mode:
-                if self.game.undo_move():
-                    self.game_over = False
-                    self.message = "Move undone."
-                else:
-                    self.message = "Nothing to undo."
-                self._restart_analysis()
-                return {"ok": True}
-
-            n = 1 if not self.human_turn else 2
-            if len(self.game.move_history) < n:
-                self.message = "Nothing to undo."
-                self._restart_analysis()
-                return {"ok": True}
-
-            for _ in range(n):
-                self.game.undo_move()
-            self.game_over = False
-            self.human_turn = (
-                self.game.current_player == self.human_player
-            )
-            self.message = "Move undone."
-
-            if not self.human_turn:
-                self._begin_ai_turn()
-            else:
-                self._restart_analysis()
-            return {"ok": True}
-
-    def set_difficulty(self, difficulty, custom_sims=None):
-        with self.lock:
-            try:
-                if difficulty == "custom" and custom_sims is not None:
-                    label, sims = resolve_difficulty(str(int(custom_sims)))
-                else:
-                    label, sims = resolve_difficulty(difficulty)
-            except ValueError as e:
-                return {"error": str(e)}
-            self.difficulty_label = label
-            self.difficulty_sims = sims
-            self.ai.difficulty = label
-            self.ai.sims = sims
-            self.message = f"Difficulty: {label} ({sims} sims)."
-            return {"ok": True}
-
-    def toggle_analysis(self, enabled):
-        with self.lock:
-            self.analysis_enabled = bool(enabled)
-            if enabled:
-                self._restart_analysis()
-            else:
-                self._stop_analysis()
-            return {"ok": True}
-
-    def toggle_mode(self):
-        with self.lock:
-            if self.ai_thinking:
-                return {"error": "Wait for AI to finish."}
-            if self.human_only_mode:
-                self.human_only_mode = False
-                self.human_player = -self.game.current_player
-                self.human_turn = False
-                self._stop_analysis()
-                if not self.game_over:
-                    self.message = "Switched to Human vs AI. AI thinking..."
-                    self._begin_ai_turn()
-                else:
-                    self.message = "Switched to Human vs AI."
-            else:
-                self.human_only_mode = True
-                self.human_turn = True
-                self.message = "Switched to Human vs Human."
-                self._restart_analysis()
-            return {"ok": True}
-
-    def save_game(self):
-        with self.lock:
-            return {
-                "format": "gomokuzero-web-save",
-                "version": 1,
-                "board_size": int(BOARD_SIZE),
-                "saved_at": float(time.time()),
-                "human_only_mode": bool(self.human_only_mode),
-                "human_player": int(self.human_player),
-                "game_over": bool(self.game_over),
-                "move_history": [
-                    [int(r), int(c), int(p)]
-                    for r, c, p in self.game.move_history
-                ],
-                "difficulty_label": self.difficulty_label,
-                "difficulty_sims": self.difficulty_sims,
-                "analysis_enabled": self.analysis_enabled,
-            }
-
-    def load_game(self, payload):
-        with self.lock:
-            if self.ai_thinking:
-                return {"error": "Wait for AI to finish."}
-            try:
-                if not isinstance(payload, dict):
-                    raise ValueError("Invalid save format.")
-                fmt = payload.get("format", "")
-                if fmt not in ("gomokuzero-web-save", "gomokuzero-qt-save"):
-                    raise ValueError(f"Unknown format: {fmt}")
-                bs = int(payload.get("board_size", 0))
-                if bs != BOARD_SIZE:
-                    raise ValueError(
-                        f"Board size {bs} != {BOARD_SIZE}.")
-
-                game, game_over = self._restore_game(
-                    payload.get("move_history", []))
-
-                self._stop_analysis()
-                self._ai_turn_gen += 1
-                self.ai_thinking = False
-                self.game = game
-                self.game_over = game_over
-                self.human_only_mode = bool(
-                    payload.get("human_only_mode", False))
-                self.human_player = int(
-                    payload.get("human_player", PLAYER1))
-
-                if "difficulty_label" in payload:
-                    self.difficulty_label = str(payload["difficulty_label"])
-                if "difficulty_sims" in payload:
-                    self.difficulty_sims = int(payload["difficulty_sims"])
-                    self.ai.difficulty = self.difficulty_label
-                    self.ai.sims = self.difficulty_sims
-
-                self.analysis_enabled = bool(
-                    payload.get("analysis_enabled", False))
-
-                if self.human_only_mode:
-                    self.human_turn = True
-                else:
-                    self.human_turn = (
-                        self.game.current_player == self.human_player
-                    )
-
-                if (not self.human_only_mode and not self.game_over
-                        and not self.human_turn):
-                    self.message = "Game loaded. AI thinking..."
-                    self._begin_ai_turn()
-                else:
-                    self.message = "Game loaded."
-                    self._restart_analysis()
-
-                return {"ok": True}
-            except (ValueError, KeyError, TypeError) as e:
-                return {"error": str(e)}
-
-    @staticmethod
-    def _restore_game(raw_history):
-        if not isinstance(raw_history, list):
-            raise ValueError("Invalid move_history.")
-        game = GomokuGame()
-        game_over = False
-        for i, move in enumerate(raw_history):
-            if not isinstance(move, (list, tuple)) or len(move) < 2:
-                raise ValueError("Invalid move entry.")
-            row, col = int(move[0]), int(move[1])
-            if not (0 <= row < BOARD_SIZE and 0 <= col < BOARD_SIZE):
-                raise ValueError("Move out of bounds.")
-            reward, done = game.make_move(row, col)
-            if reward == -1:
-                raise ValueError("Illegal move in history.")
-            if done:
-                game_over = True
-                if i != len(raw_history) - 1:
-                    raise ValueError("Moves after game end.")
-        return game, game_over
-
-    # -- AI turn (background thread) --
-
-    def _begin_ai_turn(self):
-        """Start AI computation. Caller must hold self.lock."""
-        if self.game_over:
-            return
-        self._ai_turn_gen += 1
-        gen = self._ai_turn_gen
-        self.ai_thinking = True
-        self.human_turn = False
-        t = threading.Thread(
-            target=self._run_ai_turn, args=(gen,), daemon=True)
-        t.start()
-
-    def _run_ai_turn(self, gen):
-        try:
-            with self.lock:
-                if gen != self._ai_turn_gen:
-                    return
-                game_copy = self.game.copy()
-                ai = self.ai
-
-            row, col, val = ai.get_move(game_copy)
-
-            with self.lock:
-                if gen != self._ai_turn_gen:
-                    return
-                if self.game.board[row, col] != EMPTY:
-                    self.message = f"AI illegal move ({row},{col})."
-                    self.ai_thinking = False
-                    self.human_turn = True
-                    return
-                reward, done = self.game.make_move(row, col)
-                self.ai_thinking = False
-                if done:
-                    self.game_over = True
-                    tag = "AI wins!" if reward == 1 else "Draw!"
-                    self.message = (
-                        f"{tag} AI played ({row},{col}) "
-                        f"eval {val:+.2f}"
-                    )
-                else:
-                    self.human_turn = True
-                    self.message = (
-                        f"AI played ({row},{col}) eval {val:+.2f}. "
-                        f"Your turn."
-                    )
-                self._restart_analysis()
-        except Exception as e:
-            with self.lock:
-                if gen == self._ai_turn_gen:
-                    self.message = f"AI error: {e}"
-                    self.ai_thinking = False
-                    self.human_turn = True
-
-    # -- Analysis management --
-
-    def _stop_analysis(self):
-        """Stop worker. Caller must hold self.lock."""
-        w = self.analysis_worker
-        if w is not None:
-            w.stop()
-            self.analysis_worker = None
-        self.analysis_session_id += 1
-
-    def _restart_analysis(self):
-        """Restart analysis if appropriate. Caller must hold self.lock."""
-        self._stop_analysis()
-        if not self.analysis_enabled:
-            return
-        if self.game_over:
-            return
-        if not self.human_turn and not self.human_only_mode:
-            return
-        self.analysis_session_id += 1
-        self.analysis_started_at = time.time()
-        worker = AnalysisWorker(
-            session_id=self.analysis_session_id,
-            predict_fn=self.predict_fn,
-            game=self.game,
-            batch_size=AI_MCTS_BATCH,
-            c_puct=1.5,
-        )
-        self.analysis_worker = worker
-        worker.start()
-
-
-# ---------------------------------------------------------------------------
-# Flask routes
-# ---------------------------------------------------------------------------
-
-server = GameServer()
-
-
 @app.route("/")
 def index():
     return render_template("play_web.html")
 
 
-@app.route("/api/state")
-def api_state():
-    return jsonify(server.get_state())
+@app.route("/api/ai_move", methods=["POST"])
+def api_ai_move():
+    """Compute AI's next move.
 
-
-@app.route("/api/new_game", methods=["POST"])
-def api_new_game():
+    Request:  {move_history: [[r,c],...], sims: 500}
+    Response: {row, col, eval}
+    """
     data = request.get_json(force=True)
-    return jsonify(server.new_game(
-        side=data.get("side"),
-        mode=data.get("mode"),
-    ))
+    try:
+        game = _reconstruct_game(data.get("move_history", []))
+    except ValueError as e:
+        return jsonify({"error": str(e)})
+
+    sims = max(1, min(int(data.get("sims", 500)), MAX_SIMS))
+
+    root = mcts_search_batched(
+        game, predict_fn,
+        num_simulations=sims,
+        batch_size=MCTS_BATCH,
+        c_puct=1.5,
+        add_noise=False,
+    )
+    pi = mcts_policy(root, temperature=0.05)
+    idx = int(np.argmax(pi))
+    row, col = divmod(idx, BOARD_SIZE)
+
+    return jsonify({
+        "row": row,
+        "col": col,
+        "eval": round(float(root.q_value), 4),
+    })
 
 
-@app.route("/api/move", methods=["POST"])
-def api_move():
+@app.route("/api/analyze", methods=["POST"])
+def api_analyze():
+    """Run MCTS analysis on the current position.
+
+    Request:  {move_history: [[r,c],...], sims: 500}
+    Response: {policy, q_vals, root_q, sims_done}
+    """
     data = request.get_json(force=True)
-    return jsonify(server.make_move(int(data["row"]), int(data["col"])))
+    try:
+        game = _reconstruct_game(data.get("move_history", []))
+    except ValueError as e:
+        return jsonify({"error": str(e)})
 
+    sims = max(1, min(int(data.get("sims", 500)), MAX_SIMS))
 
-@app.route("/api/undo", methods=["POST"])
-def api_undo():
-    return jsonify(server.undo())
+    root = mcts_search_batched(
+        game, predict_fn,
+        num_simulations=sims,
+        batch_size=MCTS_BATCH,
+        c_puct=1.5,
+        add_noise=False,
+    )
 
+    counts = np.zeros(BOARD_SIZE * BOARD_SIZE, dtype=np.float32)
+    q_vals = np.full(BOARD_SIZE * BOARD_SIZE, np.nan, dtype=np.float32)
+    for (r, c), child in root.children.items():
+        counts[r * BOARD_SIZE + c] = child.visit_count
+        if child.visit_count:
+            q_vals[r * BOARD_SIZE + c] = -child.q_value
 
-@app.route("/api/set_difficulty", methods=["POST"])
-def api_set_difficulty():
-    data = request.get_json(force=True)
-    return jsonify(server.set_difficulty(
-        data.get("difficulty", "medium"),
-        data.get("custom_sims"),
-    ))
-
-
-@app.route("/api/toggle_analysis", methods=["POST"])
-def api_toggle_analysis():
-    data = request.get_json(force=True)
-    return jsonify(server.toggle_analysis(data.get("enabled", False)))
-
-
-@app.route("/api/toggle_mode", methods=["POST"])
-def api_toggle_mode():
-    return jsonify(server.toggle_mode())
-
-
-@app.route("/api/save_game", methods=["POST"])
-def api_save_game():
-    return jsonify(server.save_game())
-
-
-@app.route("/api/load_game", methods=["POST"])
-def api_load_game():
-    data = request.get_json(force=True)
-    return jsonify(server.load_game(data))
+    return jsonify({
+        "policy": [round(float(v), 1) for v in counts],
+        "q_vals": [
+            None if np.isnan(v) else round(float(v), 4)
+            for v in q_vals
+        ],
+        "root_q": round(float(root.q_value), 4),
+        "sims_done": int(sims),
+    })
 
 
 # ---------------------------------------------------------------------------
-# Entry point
+# Local dev entry point
 # ---------------------------------------------------------------------------
 
-def main():
+if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="GomokuZero Web UI")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=5000)
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
-
     print(f"\n  GomokuZero Web UI: http://{args.host}:{args.port}\n")
     app.run(host=args.host, port=args.port, debug=args.debug, threaded=True)
-
-
-if __name__ == "__main__":
-    main()

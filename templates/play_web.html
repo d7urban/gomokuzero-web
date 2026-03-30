@@ -80,7 +80,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
           <option value="hard">Hard</option>
           <option value="custom">Custom</option>
         </select>
-        <input type="number" id="custom-sims" value="500" min="1" max="20000"
+        <input type="number" id="custom-sims" value="500" min="1" max="5000"
                style="display:none;width:70px">
       </div>
       <div class="form-row">
@@ -119,7 +119,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
     <!-- Message -->
     <div class="card">
       <h3>Message</h3>
-      <div class="msg" id="st-message">Connecting...</div>
+      <div class="msg" id="st-message">Your turn (Black).</div>
     </div>
   </div>
 </div>
@@ -128,19 +128,211 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 
 <script>
 // ---------------------------------------------------------------------------
-// Constants
+// Constants & state
 // ---------------------------------------------------------------------------
 const N = 15;
-const EMPTY = 0, P1 = 1, P2 = -1;
+const P1 = 1, P2 = -1, EMPTY = 0;
+const DIFF_SIMS = {easy: 250, medium: 500, hard: 2000};
 
-let S = null;          // latest game state from server
-let hover = null;      // [row, col] or null
-let pollId = null;
-let pollMs = 2000;
-let busy = false;      // prevent double-clicks during API call
+let board = [];
+let moveHistory = [];   // [[r,c], ...]
+let currentPlayer = P1;
+let gameOver = false;
+let winner = 0;         // 0=none/draw, P1 or P2
+
+let humanPlayer = P1;
+let humanOnlyMode = false;
+let difficultyLabel = 'medium';
+let difficultySims = 500;
+let analysisEnabled = false;
+let analysisData = null;
+let aiThinking = false;
+let busy = false;
+let message = 'Your turn (Black).';
+let hover = null;
+
+let analysisTimer = null;
+let analysisGen = 0;    // invalidate stale analysis responses
 
 const canvas = document.getElementById('board');
 const ctx = canvas.getContext('2d');
+const $ = id => document.getElementById(id);
+
+// ---------------------------------------------------------------------------
+// Game logic (client-side)
+// ---------------------------------------------------------------------------
+function initBoard() {
+  board = Array.from({length: N}, () => Array(N).fill(EMPTY));
+  moveHistory = [];
+  currentPlayer = P1;
+  gameOver = false;
+  winner = 0;
+  analysisData = null;
+}
+
+function makeMove(r, c) {
+  if (gameOver || board[r][c] !== EMPTY) return false;
+  const player = currentPlayer;
+  board[r][c] = player;
+  moveHistory.push([r, c]);
+  if (checkWin(r, c, player)) {
+    gameOver = true;
+    winner = player;
+    return true;
+  }
+  if (moveHistory.length >= N * N) {
+    gameOver = true;
+    winner = 0;
+    return true;
+  }
+  currentPlayer = -currentPlayer;
+  return true;
+}
+
+function replayMoves(moves) {
+  initBoard();
+  for (const [r, c] of moves) makeMove(r, c);
+}
+
+function undoN(n) {
+  if (moveHistory.length < n) return false;
+  replayMoves(moveHistory.slice(0, -n));
+  return true;
+}
+
+function checkWin(r, c, player) {
+  const dirs = [[0,1],[1,0],[1,1],[1,-1]];
+  for (const [dr, dc] of dirs) {
+    let count = 1;
+    for (let d = 1; d < 5; d++) {
+      const nr = r+dr*d, nc = c+dc*d;
+      if (nr<0||nr>=N||nc<0||nc>=N||board[nr][nc]!==player) break;
+      count++;
+    }
+    for (let d = 1; d < 5; d++) {
+      const nr = r-dr*d, nc = c-dc*d;
+      if (nr<0||nr>=N||nc<0||nc>=N||board[nr][nc]!==player) break;
+      count++;
+    }
+    if (count >= 5) return true;
+  }
+  return false;
+}
+
+function findWinningCells() {
+  if (!gameOver || winner === 0 || moveHistory.length === 0) return [];
+  const [r, c] = moveHistory[moveHistory.length - 1];
+  const player = board[r][c];
+  if (player === EMPTY) return [];
+  const dirs = [[0,1],[1,0],[1,1],[1,-1]];
+  for (const [dr, dc] of dirs) {
+    let cells = [[r, c]];
+    for (let d = 1; d < N; d++) {
+      const nr = r+dr*d, nc = c+dc*d;
+      if (nr<0||nr>=N||nc<0||nc>=N||board[nr][nc]!==player) break;
+      cells.push([nr, nc]);
+    }
+    for (let d = 1; d < N; d++) {
+      const nr = r-dr*d, nc = c-dc*d;
+      if (nr<0||nr>=N||nc<0||nc>=N||board[nr][nc]!==player) break;
+      cells.unshift([nr, nc]);
+    }
+    if (cells.length >= 5) return cells;
+  }
+  return [];
+}
+
+function isHumanTurn() {
+  return humanOnlyMode || currentPlayer === humanPlayer;
+}
+
+// ---------------------------------------------------------------------------
+// API helper
+// ---------------------------------------------------------------------------
+async function api(url, body) {
+  const r = await fetch(url, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body),
+  });
+  return r.json();
+}
+
+// ---------------------------------------------------------------------------
+// AI move
+// ---------------------------------------------------------------------------
+async function requestAiMove() {
+  if (gameOver || humanOnlyMode) return;
+  aiThinking = true;
+  message = 'AI thinking...';
+  updateUI(); draw();
+
+  try {
+    const resp = await api('/api/ai_move', {
+      move_history: moveHistory,
+      sims: difficultySims,
+    });
+    if (resp.error) {
+      message = 'AI error: ' + resp.error;
+      aiThinking = false;
+      updateUI(); draw();
+      return;
+    }
+    const {row, col} = resp;
+    const ev = resp.eval;
+    makeMove(row, col);
+    aiThinking = false;
+    if (gameOver) {
+      const tag = winner !== 0 ? 'AI wins!' : 'Draw!';
+      message = `${tag} AI played (${row},${col}) eval ${ev >= 0 ? '+' : ''}${ev.toFixed(2)}`;
+    } else {
+      message = `AI played (${row},${col}) eval ${ev >= 0 ? '+' : ''}${ev.toFixed(2)}. Your turn.`;
+    }
+  } catch(e) {
+    message = 'AI error: ' + e;
+    aiThinking = false;
+  }
+  updateUI(); draw();
+  scheduleAnalysis();
+}
+
+// ---------------------------------------------------------------------------
+// Analysis
+// ---------------------------------------------------------------------------
+function scheduleAnalysis() {
+  stopAnalysis();
+  if (!analysisEnabled || gameOver) return;
+  if (!humanOnlyMode && currentPlayer !== humanPlayer) return;
+  analysisData = null;
+  analysisGen++;
+  doAnalysis(analysisGen);
+}
+
+async function doAnalysis(gen) {
+  if (gen !== analysisGen) return;
+  if (!analysisEnabled || gameOver) return;
+  const t0 = performance.now();
+  try {
+    const resp = await api('/api/analyze', {
+      move_history: moveHistory,
+      sims: 500,
+    });
+    if (gen !== analysisGen) return;
+    if (resp.error) return;
+    const elapsed = (performance.now() - t0) / 1000;
+    resp.sims_per_sec = elapsed > 0 ? Math.round(resp.sims_done / elapsed) : 0;
+    analysisData = resp;
+    updateUI(); draw();
+  } catch(e) { /* ignore */ }
+  if (gen === analysisGen && analysisEnabled && !gameOver) {
+    analysisTimer = setTimeout(() => doAnalysis(gen), 2000);
+  }
+}
+
+function stopAnalysis() {
+  analysisGen++;
+  if (analysisTimer) { clearTimeout(analysisTimer); analysisTimer = null; }
+}
 
 // ---------------------------------------------------------------------------
 // Canvas sizing
@@ -151,129 +343,10 @@ function resizeCanvas() {
   const maxH = window.innerHeight - 60;
   const sz = Math.max(320, Math.min(maxW, maxH, 640));
   canvas.width = canvas.height = sz;
-  if (S) draw();
+  draw();
 }
 window.addEventListener('resize', resizeCanvas);
 resizeCanvas();
-
-// ---------------------------------------------------------------------------
-// API helpers
-// ---------------------------------------------------------------------------
-async function api(url, body) {
-  const opts = body !== undefined
-    ? { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) }
-    : {};
-  const r = await fetch(url, opts);
-  return r.json();
-}
-
-async function fetchState() {
-  try {
-    S = await api('/api/state');
-    updateUI();
-    draw();
-    adjustPoll();
-  } catch(e) {
-    document.getElementById('st-message').textContent = 'Connection lost. Retrying...';
-  }
-}
-
-function adjustPoll() {
-  const fast = S && (S.ai_thinking || S.analysis_enabled);
-  const want = fast ? 200 : 2000;
-  if (want !== pollMs) {
-    pollMs = want;
-    clearInterval(pollId);
-    pollId = setInterval(fetchState, pollMs);
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Controls wiring
-// ---------------------------------------------------------------------------
-const $  = id => document.getElementById(id);
-
-$('game-mode').onchange = e => {
-  const ai = e.target.value === 'ai';
-  $('side-row').style.display = ai ? 'flex' : 'none';
-  $('diff-row').style.display = ai ? 'flex' : 'none';
-};
-
-$('difficulty').onchange = e => {
-  const c = e.target.value === 'custom';
-  $('custom-sims').style.display = c ? 'inline' : 'none';
-  if (!c) api('/api/set_difficulty', {difficulty: e.target.value}).then(fetchState);
-};
-
-$('custom-sims').onchange = e => {
-  api('/api/set_difficulty', {difficulty:'custom', custom_sims: +e.target.value}).then(fetchState);
-};
-
-$('analysis-chk').onchange = e => {
-  api('/api/toggle_analysis', {enabled: e.target.checked}).then(fetchState);
-};
-
-$('btn-new').onclick = async () => {
-  if (busy) return; busy = true;
-  try {
-    const r = await api('/api/new_game', {
-      mode: $('game-mode').value,
-      side: $('side-select').value,
-    });
-    if (r.error) alert(r.error);
-  } finally { busy = false; }
-  fetchState();
-};
-
-$('btn-undo').onclick = async () => {
-  if (busy) return; busy = true;
-  try {
-    const r = await api('/api/undo', {});
-    if (r.error) alert(r.error);
-  } finally { busy = false; }
-  fetchState();
-};
-
-$('btn-mode-toggle').onclick = async () => {
-  if (busy) return; busy = true;
-  try {
-    const r = await api('/api/toggle_mode', {});
-    if (r.error) alert(r.error);
-  } finally { busy = false; }
-  fetchState();
-};
-
-$('btn-save').onclick = async () => {
-  const data = await api('/api/save_game', {});
-  const blob = new Blob([JSON.stringify(data, null, 2)], {type:'application/json'});
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob);
-  a.download = 'gomoku_save.json';
-  a.click();
-  URL.revokeObjectURL(a.href);
-};
-
-$('btn-load-game').onclick = () => $('file-input').click();
-
-$('file-input').onchange = async e => {
-  const f = e.target.files[0];
-  if (!f) return;
-  try {
-    const data = JSON.parse(await f.text());
-    const r = await api('/api/load_game', data);
-    if (r.error) alert(r.error);
-  } catch(ex) { alert('Invalid file: ' + ex); }
-  fetchState();
-  e.target.value = '';
-};
-
-// Keyboard shortcuts
-document.addEventListener('keydown', e => {
-  if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
-  if (e.key === 'n') $('btn-new').click();
-  if (e.key === 'u' || e.key === 'z') $('btn-undo').click();
-  if (e.key === 'a') { $('analysis-chk').checked = !$('analysis-chk').checked; $('analysis-chk').onchange({target:$('analysis-chk')}); }
-});
 
 // ---------------------------------------------------------------------------
 // Canvas interaction
@@ -294,30 +367,231 @@ function canvasToBoard(e) {
 
 canvas.onmousemove = e => {
   const p = canvasToBoard(e);
-  if (p && S && S.board[p[0]][p[1]] === EMPTY) hover = p;
+  if (p && board[p[0]][p[1]] === EMPTY) hover = p;
   else hover = null;
   draw();
 };
 canvas.onmouseleave = () => { hover = null; draw(); };
 
 canvas.onclick = async e => {
-  if (!S || busy) return;
+  if (busy || gameOver || aiThinking) return;
   const p = canvasToBoard(e);
   if (!p) return;
+  const [r, c] = p;
+  if (board[r][c] !== EMPTY) return;
+  if (!humanOnlyMode && currentPlayer !== humanPlayer) return;
+
+  if (!makeMove(r, c)) return;
+  stopAnalysis();
+  analysisData = null;
+
+  if (gameOver) {
+    if (winner !== 0) {
+      if (humanOnlyMode) {
+        message = (winner === P1 ? 'Black' : 'White') + ' wins!';
+      } else {
+        message = 'You win!';
+      }
+    } else {
+      message = 'Draw!';
+    }
+    updateUI(); draw();
+    return;
+  }
+
+  if (humanOnlyMode) {
+    message = (currentPlayer === P1 ? 'Black' : 'White') + ' to play.';
+    updateUI(); draw();
+    scheduleAnalysis();
+    return;
+  }
+
+  // AI's turn
+  message = `You played (${r},${c}). AI thinking...`;
+  updateUI(); draw();
   busy = true;
-  try {
-    const r = await api('/api/move', {row: p[0], col: p[1]});
-    if (r.error) $('st-message').textContent = r.error;
-  } finally { busy = false; }
-  hover = null;
-  fetchState();
+  try { await requestAiMove(); }
+  finally { busy = false; }
 };
+
+// ---------------------------------------------------------------------------
+// Controls wiring
+// ---------------------------------------------------------------------------
+$('game-mode').onchange = e => {
+  const ai = e.target.value === 'ai';
+  $('side-row').style.display = ai ? 'flex' : 'none';
+  $('diff-row').style.display = ai ? 'flex' : 'none';
+};
+
+$('difficulty').onchange = e => {
+  const c = e.target.value === 'custom';
+  $('custom-sims').style.display = c ? 'inline' : 'none';
+  if (!c) {
+    difficultyLabel = e.target.value;
+    difficultySims = DIFF_SIMS[difficultyLabel] || 500;
+    message = `Difficulty: ${difficultyLabel} (${difficultySims} sims).`;
+    updateUI();
+  }
+};
+
+$('custom-sims').onchange = e => {
+  const v = Math.max(1, Math.min(5000, +e.target.value));
+  e.target.value = v;
+  difficultyLabel = 'Custom';
+  difficultySims = v;
+  message = `Difficulty: Custom (${v} sims).`;
+  updateUI();
+};
+
+$('analysis-chk').onchange = e => {
+  analysisEnabled = e.target.checked;
+  if (analysisEnabled) scheduleAnalysis();
+  else { stopAnalysis(); analysisData = null; }
+  updateUI(); draw();
+};
+
+$('btn-new').onclick = async () => {
+  if (busy) return;
+  stopAnalysis();
+  const mode = $('game-mode').value;
+  humanOnlyMode = mode === 'human';
+  initBoard();
+
+  if (humanOnlyMode) {
+    humanPlayer = P1;
+    message = 'New game (Human vs Human). Black plays first.';
+    updateUI(); draw();
+    scheduleAnalysis();
+  } else {
+    const side = $('side-select').value;
+    humanPlayer = side === 'ai_first' ? P2 : P1;
+    if (currentPlayer !== humanPlayer) {
+      message = 'New game. AI goes first...';
+      updateUI(); draw();
+      busy = true;
+      try { await requestAiMove(); }
+      finally { busy = false; }
+    } else {
+      message = 'New game. Your turn (Black).';
+      updateUI(); draw();
+      scheduleAnalysis();
+    }
+  }
+};
+
+$('btn-undo').onclick = async () => {
+  if (busy || aiThinking) return;
+  stopAnalysis();
+  analysisData = null;
+  if (humanOnlyMode) {
+    if (undoN(1)) message = 'Move undone.';
+    else message = 'Nothing to undo.';
+  } else {
+    // Undo both AI + human move (or just one if it's AI's turn somehow)
+    const n = isHumanTurn() ? 2 : 1;
+    if (undoN(n)) message = 'Move undone.';
+    else message = 'Nothing to undo.';
+  }
+  updateUI(); draw();
+  scheduleAnalysis();
+};
+
+$('btn-mode-toggle').onclick = async () => {
+  if (busy || aiThinking) return;
+  stopAnalysis();
+  analysisData = null;
+  if (humanOnlyMode) {
+    humanOnlyMode = false;
+    humanPlayer = -currentPlayer;
+    if (!gameOver) {
+      message = 'Switched to Human vs AI. AI thinking...';
+      updateUI(); draw();
+      busy = true;
+      try { await requestAiMove(); }
+      finally { busy = false; }
+    } else {
+      message = 'Switched to Human vs AI.';
+      updateUI(); draw();
+    }
+  } else {
+    humanOnlyMode = true;
+    message = 'Switched to Human vs Human.';
+    updateUI(); draw();
+    scheduleAnalysis();
+  }
+};
+
+$('btn-save').onclick = () => {
+  const data = {
+    format: 'gomokuzero-web-save',
+    version: 2,
+    board_size: N,
+    saved_at: Date.now() / 1000,
+    human_only_mode: humanOnlyMode,
+    human_player: humanPlayer,
+    move_history: moveHistory,
+    difficulty_label: difficultyLabel,
+    difficulty_sims: difficultySims,
+    analysis_enabled: analysisEnabled,
+  };
+  const blob = new Blob([JSON.stringify(data, null, 2)], {type: 'application/json'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'gomoku_save.json';
+  a.click();
+  URL.revokeObjectURL(a.href);
+};
+
+$('btn-load-game').onclick = () => $('file-input').click();
+
+$('file-input').onchange = async e => {
+  const f = e.target.files[0];
+  if (!f) return;
+  try {
+    const data = JSON.parse(await f.text());
+    if (!data.move_history) throw new Error('No move_history');
+    const bs = data.board_size || N;
+    if (bs !== N) throw new Error(`Board size ${bs} != ${N}`);
+
+    stopAnalysis();
+    // Replay: accept both [r,c] and [r,c,player] formats
+    const moves = data.move_history.map(m => [m[0], m[1]]);
+    replayMoves(moves);
+
+    humanOnlyMode = !!data.human_only_mode;
+    humanPlayer = data.human_player || P1;
+    if (data.difficulty_label) difficultyLabel = data.difficulty_label;
+    if (data.difficulty_sims) difficultySims = data.difficulty_sims;
+    analysisEnabled = !!data.analysis_enabled;
+    $('analysis-chk').checked = analysisEnabled;
+
+    message = 'Game loaded.';
+    updateUI(); draw();
+
+    // If it's AI's turn, request a move
+    if (!humanOnlyMode && !gameOver && currentPlayer !== humanPlayer) {
+      busy = true;
+      try { await requestAiMove(); }
+      finally { busy = false; }
+    } else {
+      scheduleAnalysis();
+    }
+  } catch(ex) { alert('Invalid file: ' + ex); }
+  e.target.value = '';
+};
+
+// Keyboard shortcuts
+document.addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
+  if (e.key === 'n') $('btn-new').click();
+  if (e.key === 'u' || e.key === 'z') $('btn-undo').click();
+  if (e.key === 'a') { $('analysis-chk').checked = !$('analysis-chk').checked; $('analysis-chk').onchange({target:$('analysis-chk')}); }
+});
 
 // ---------------------------------------------------------------------------
 // Board drawing
 // ---------------------------------------------------------------------------
 function draw() {
-  if (!S) return;
   const sz = canvas.width;
   const margin = sz * 0.05;
   const cell = (sz - 2 * margin) / (N - 1);
@@ -359,16 +633,16 @@ function draw() {
   }
 
   // Analysis overlay
-  if (S.analysis && S.analysis.policy) drawAnalysis(margin, cell, stoneR);
+  if (analysisData && analysisData.policy) drawAnalysis(margin, cell, stoneR);
 
   // Stones
-  const winSet = new Set((S.winning_cells || []).map(c => c[0]*N+c[1]));
+  const winCells = findWinningCells();
+  const winSet = new Set(winCells.map(c => c[0]*N+c[1]));
   for (let r = 0; r < N; r++) for (let c = 0; c < N; c++) {
-    const v = S.board[r][c];
+    const v = board[r][c];
     if (v === EMPTY) continue;
     const x = margin + c * cell, y = margin + r * cell;
     drawStone(x, y, stoneR, v === P1);
-    // Winning glow
     if (winSet.has(r*N+c)) {
       ctx.save();
       ctx.strokeStyle = '#FFD700';
@@ -381,8 +655,8 @@ function draw() {
   }
 
   // Last move marker
-  if (S.last_move) {
-    const [lr, lc] = S.last_move;
+  if (moveHistory.length > 0) {
+    const [lr, lc] = moveHistory[moveHistory.length - 1];
     const x = margin + lc * cell, y = margin + lr * cell;
     ctx.fillStyle = '#e74c3c';
     ctx.beginPath();
@@ -391,11 +665,11 @@ function draw() {
   }
 
   // Hover preview
-  if (hover && !S.game_over && (S.human_turn || S.human_only_mode) && !S.ai_thinking) {
+  if (hover && !gameOver && isHumanTurn() && !aiThinking) {
     const [hr, hc] = hover;
-    if (S.board[hr][hc] === EMPTY) {
+    if (board[hr][hc] === EMPTY) {
       ctx.globalAlpha = 0.35;
-      drawStone(margin + hc * cell, margin + hr * cell, stoneR, S.current_player === P1);
+      drawStone(margin + hc * cell, margin + hr * cell, stoneR, currentPlayer === P1);
       ctx.globalAlpha = 1;
     }
   }
@@ -407,9 +681,7 @@ function draw() {
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
   for (let i = 0; i < N; i++) {
-    // Column letters (top)
     ctx.fillText(String.fromCharCode(65 + i), margin + i * cell, margin - fontSize * 1.1);
-    // Row numbers (left)
     ctx.fillText(String(i + 1), margin - fontSize * 1.3, margin + i * cell);
   }
 }
@@ -420,7 +692,6 @@ function drawStone(x, y, r, black) {
   ctx.shadowBlur = r * 0.3;
   ctx.shadowOffsetX = r * 0.08;
   ctx.shadowOffsetY = r * 0.12;
-
   const g = ctx.createRadialGradient(x - r*0.3, y - r*0.3, r*0.05, x + r*0.1, y + r*0.1, r);
   if (black) {
     g.addColorStop(0, '#5a5a5a');
@@ -439,16 +710,16 @@ function drawStone(x, y, r, black) {
 }
 
 function drawAnalysis(margin, cell, stoneR) {
-  const pol = S.analysis.policy;
-  const qv = S.analysis.q_vals;
+  const pol = analysisData.policy;
+  const qv = analysisData.q_vals;
   let maxV = 0;
   for (let r = 0; r < N; r++) for (let c = 0; c < N; c++) {
-    if (S.board[r][c] === EMPTY) maxV = Math.max(maxV, pol[r*N+c]);
+    if (board[r][c] === EMPTY) maxV = Math.max(maxV, pol[r*N+c]);
   }
   if (maxV <= 0) return;
 
   for (let r = 0; r < N; r++) for (let c = 0; c < N; c++) {
-    if (S.board[r][c] !== EMPTY) continue;
+    if (board[r][c] !== EMPTY) continue;
     const idx = r * N + c;
     const vis = pol[idx];
     if (vis < 1) continue;
@@ -471,7 +742,6 @@ function drawAnalysis(margin, cell, stoneR) {
     ctx.arc(x, y, rad, 0, Math.PI * 2);
     ctx.fill();
 
-    // Win% text for top candidates
     if (vis >= maxV * 0.12 && q !== null && q !== undefined) {
       const wp = Math.round((q + 1) / 2 * 100);
       ctx.fillStyle = '#000';
@@ -487,30 +757,27 @@ function drawAnalysis(margin, cell, stoneR) {
 // UI update (status panel)
 // ---------------------------------------------------------------------------
 function updateUI() {
-  if (!S) return;
-  $('st-mode').textContent = S.human_only_mode ? 'Human vs Human' : 'Human vs AI';
-  $('st-diff').textContent = S.human_only_mode ? 'N/A' : S.difficulty;
-  $('st-moves').textContent = S.move_count;
-  $('st-message').textContent = S.message;
+  $('st-mode').textContent = humanOnlyMode ? 'Human vs Human' : 'Human vs AI';
+  $('st-diff').textContent = humanOnlyMode ? 'N/A' : `${difficultyLabel} (${difficultySims} sims)`;
+  $('st-moves').textContent = moveHistory.length;
+  $('st-message').textContent = message;
 
-  // Turn
   let turn = 'Game over';
-  if (!S.game_over) {
-    const side = S.current_player === P1 ? 'Black' : 'White';
-    if (S.human_only_mode) turn = `Human (${side})`;
-    else if (S.ai_thinking) turn = `AI thinking (${side})...`;
-    else turn = S.human_turn ? `Your turn (${side})` : `AI (${side})`;
+  if (!gameOver) {
+    const side = currentPlayer === P1 ? 'Black' : 'White';
+    if (humanOnlyMode) turn = `Human (${side})`;
+    else if (aiThinking) turn = `AI thinking (${side})...`;
+    else turn = isHumanTurn() ? `Your turn (${side})` : `AI (${side})`;
   }
   $('st-turn').textContent = turn;
 
-  // Analysis status
-  if (!S.analysis_enabled) {
+  if (!analysisEnabled) {
     $('st-analysis').textContent = 'Off';
     $('st-sps').textContent = '-';
-  } else if (S.analysis) {
-    const rq = S.analysis.root_q;
-    $('st-analysis').textContent = `${S.analysis.sims_done} sims, root ${rq >= 0 ? '+' : ''}${rq.toFixed(2)}`;
-    $('st-sps').textContent = S.analysis.sims_per_sec > 0 ? S.analysis.sims_per_sec.toFixed(1) : '-';
+  } else if (analysisData) {
+    const rq = analysisData.root_q;
+    $('st-analysis').textContent = `${analysisData.sims_done} sims, root ${rq >= 0 ? '+' : ''}${rq.toFixed(2)}`;
+    $('st-sps').textContent = analysisData.sims_per_sec > 0 ? analysisData.sims_per_sec : '-';
   } else {
     $('st-analysis').textContent = 'Starting...';
     $('st-sps').textContent = '-';
@@ -520,9 +787,9 @@ function updateUI() {
 // ---------------------------------------------------------------------------
 // Init
 // ---------------------------------------------------------------------------
-fetchState().then(() => {
-  pollId = setInterval(fetchState, pollMs);
-});
+initBoard();
+updateUI();
+draw();
 </script>
 </body>
 </html>
