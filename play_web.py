@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Gomoku - Play with a Web UI.
 
-Feature-equivalent to play_qt.py: Human-vs-AI, Human-vs-Human, continuous
-analysis heatmap, undo, save/load, difficulty and side selection.
+Human-vs-AI, Human-vs-Human, continuous analysis heatmap, undo,
+save/load, difficulty and side selection.
 
-Requires: pip install flask
+Uses TFLite for inference (no full TensorFlow dependency).
+
+Requires: pip install flask numpy ai-edge-litert
 """
 
 import os
@@ -13,11 +15,6 @@ import threading
 import time
 
 import numpy as np
-
-os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"
-import tensorflow as tf
-
-tf.get_logger().setLevel("ERROR")
 
 try:
     from flask import Flask, jsonify, render_template, request
@@ -34,23 +31,121 @@ from gomoku import (
     GomokuGame,
     mcts_begin,
     mcts_expand_root,
+    mcts_policy,
     mcts_process_results,
+    mcts_search_batched,
     mcts_select_leaves,
 )
-from entrypoint_shared import (
-    AIPlayer,
-    AI_MCTS_BATCH,
-    AI_SIMULATIONS,
-    load_model_and_predict_fn,
-    resolve_difficulty,
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+MODEL_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "gomoku_best.tflite"
 )
 
-WEIGHTS_FILE = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "gomoku_best.weights.h5"
-)
-
+AI_SIMULATIONS = 500
+AI_MCTS_BATCH = 32
+DIFFICULTY_SIMS = {
+    "easy": 250,
+    "medium": 500,
+    "hard": 2000,
+}
 ANALYSIS_MAX_SIMS = 1_000_000
 ANALYSIS_EMIT_INTERVAL_SEC = 0.2
+
+
+# ---------------------------------------------------------------------------
+# TFLite inference
+# ---------------------------------------------------------------------------
+
+def make_tflite_predict_fn(model_path):
+    """Load a .tflite model and return a batched predict function.
+
+    Returns predict_fn(batch_np) -> (logits, values) with the same
+    signature as the TF-based make_predict_fn in gomoku.py.
+    """
+    from ai_edge_litert.interpreter import Interpreter
+
+    interp = Interpreter(model_path=model_path)
+    interp.allocate_tensors()
+    inp_detail = interp.get_input_details()[0]
+    out_details = interp.get_output_details()
+
+    # Identify which output is logits (225) vs value (1) by shape.
+    if out_details[0]["shape"][-1] == BOARD_SIZE * BOARD_SIZE:
+        logits_idx, value_idx = 0, 1
+    else:
+        logits_idx, value_idx = 1, 0
+
+    lock = threading.Lock()
+
+    def predict_fn(batch):
+        batch = np.asarray(batch, dtype=np.float32)
+        with lock:
+            interp.resize_tensor_input(inp_detail["index"], batch.shape)
+            interp.allocate_tensors()
+            interp.set_tensor(inp_detail["index"], batch)
+            interp.invoke()
+            logits = interp.get_tensor(out_details[logits_idx]["index"])
+            values = interp.get_tensor(out_details[value_idx]["index"])
+        return logits.copy(), values.copy()
+
+    # Warmup.
+    from gomoku import NUM_INPUT_PLANES
+    predict_fn(
+        np.zeros((1, BOARD_SIZE, BOARD_SIZE, NUM_INPUT_PLANES),
+                 dtype=np.float32)
+    )
+    return predict_fn
+
+
+# ---------------------------------------------------------------------------
+# Helpers (inlined from entrypoint_shared)
+# ---------------------------------------------------------------------------
+
+class AIPlayer:
+    """AI that selects moves via MCTS backed by a trained network."""
+
+    def __init__(self, predict_fn, simulations=AI_SIMULATIONS,
+                 difficulty="medium"):
+        self.predict_fn = predict_fn
+        self.sims = simulations
+        self.difficulty = difficulty
+
+    def get_move(self, game):
+        root = mcts_search_batched(
+            game, self.predict_fn,
+            num_simulations=self.sims,
+            batch_size=AI_MCTS_BATCH,
+            c_puct=1.5,
+            add_noise=False,
+        )
+        pi = mcts_policy(root, temperature=0.05)
+        idx = int(np.argmax(pi))
+        row, col = divmod(idx, BOARD_SIZE)
+        return row, col, root.q_value
+
+
+def resolve_difficulty(value):
+    key = (value or "").strip().lower()
+    if key in DIFFICULTY_SIMS:
+        return key, DIFFICULTY_SIMS[key]
+    try:
+        sims = int(value)
+    except (TypeError, ValueError) as err:
+        raise ValueError(
+            "Invalid difficulty. Use easy|medium|hard or a positive integer."
+        ) from err
+    if sims <= 0:
+        raise ValueError("Custom difficulty sims must be a positive integer.")
+    return "Custom", sims
+
+
+# ---------------------------------------------------------------------------
+# Flask app
+# ---------------------------------------------------------------------------
 
 app = Flask(__name__)
 
@@ -60,7 +155,7 @@ app = Flask(__name__)
 # ---------------------------------------------------------------------------
 
 class AnalysisWorker(threading.Thread):
-    """Background MCTS pondering thread with double-buffer GPU pipeline."""
+    """Background MCTS pondering thread."""
 
     def __init__(self, session_id, predict_fn, game,
                  batch_size=AI_MCTS_BATCH, c_puct=1.5,
@@ -114,42 +209,13 @@ class AnalysisWorker(threading.Thread):
             logits_np, values_np = self.predict_fn(root_batch)
             mcts_expand_root(ctx, logits_np[0], values_np.ravel()[0])
 
-            _raw = getattr(self.predict_fn, "_raw", None)
             last_emit = 0.0
-
-            if _raw is not None:
-                self._run_double_buffer(_raw, ctx, last_emit)
-            else:
-                self._run_sync(ctx, last_emit)
-
-            self._update_snapshot(ctx)
-        except Exception as e:
-            print(f"Analysis worker error: {e}", file=sys.stderr)
-
-    def _run_double_buffer(self, _raw, ctx, last_emit):
-        slot_has_data = False
-        slot_pending = slot_eval_list = slot_n_batch = None
-        slot_tf_logits = slot_tf_values = None
-
-        while self._running and ctx["sims_done"] < ctx["sims_target"]:
-            leaf_states = mcts_select_leaves(ctx)
-            cur_pending = ctx["pending"]
-            cur_eval_list = ctx["eval_list"]
-            cur_n_batch = ctx["n_batch"]
-            if leaf_states:
-                cur_tf_logits, cur_tf_values = _raw(
-                    np.array(leaf_states, dtype=np.float32))
-            else:
-                cur_tf_logits = cur_tf_values = None
-
-            if slot_has_data:
-                ctx["pending"] = slot_pending
-                ctx["eval_list"] = slot_eval_list
-                ctx["n_batch"] = slot_n_batch
-                if slot_tf_logits is not None:
-                    mcts_process_results(
-                        ctx, slot_tf_logits.numpy(),
-                        slot_tf_values.numpy().ravel())
+            while self._running and ctx["sims_done"] < ctx["sims_target"]:
+                leaf_states = mcts_select_leaves(ctx)
+                if leaf_states:
+                    batch = np.array(leaf_states, dtype=np.float32)
+                    l_np, v_np = self.predict_fn(batch)
+                    mcts_process_results(ctx, l_np, v_np.ravel())
                 else:
                     mcts_process_results(ctx)
                 now = time.time()
@@ -157,38 +223,9 @@ class AnalysisWorker(threading.Thread):
                     self._update_snapshot(ctx)
                     last_emit = now
 
-            slot_pending = cur_pending
-            slot_eval_list = cur_eval_list
-            slot_n_batch = cur_n_batch
-            slot_tf_logits = cur_tf_logits
-            slot_tf_values = cur_tf_values
-            slot_has_data = True
-
-        # Drain last batch.
-        if slot_has_data:
-            ctx["pending"] = slot_pending
-            ctx["eval_list"] = slot_eval_list
-            ctx["n_batch"] = slot_n_batch
-            if slot_tf_logits is not None:
-                mcts_process_results(
-                    ctx, slot_tf_logits.numpy(),
-                    slot_tf_values.numpy().ravel())
-            else:
-                mcts_process_results(ctx)
-
-    def _run_sync(self, ctx, last_emit):
-        while self._running and ctx["sims_done"] < ctx["sims_target"]:
-            leaf_states = mcts_select_leaves(ctx)
-            if leaf_states:
-                batch = np.array(leaf_states, dtype=np.float32)
-                l_np, v_np = self.predict_fn(batch)
-                mcts_process_results(ctx, l_np, v_np.ravel())
-            else:
-                mcts_process_results(ctx)
-            now = time.time()
-            if now - last_emit >= ANALYSIS_EMIT_INTERVAL_SEC:
-                self._update_snapshot(ctx)
-                last_emit = now
+            self._update_snapshot(ctx)
+        except Exception as e:
+            print(f"Analysis worker error: {e}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -200,8 +237,8 @@ class GameServer:
         self.lock = threading.Lock()
         self.game = GomokuGame()
 
-        print(f"  Loading weights: {WEIGHTS_FILE}")
-        self.model, self.predict_fn = load_model_and_predict_fn(WEIGHTS_FILE)
+        print(f"  Loading model: {MODEL_FILE}")
+        self.predict_fn = make_tflite_predict_fn(MODEL_FILE)
         self.ai = AIPlayer(
             self.predict_fn,
             simulations=AI_SIMULATIONS,
@@ -423,9 +460,8 @@ class GameServer:
                 return {"error": str(e)}
             self.difficulty_label = label
             self.difficulty_sims = sims
-            if self.ai is not None:
-                self.ai.difficulty = label
-                self.ai.sims = sims
+            self.ai.difficulty = label
+            self.ai.sims = sims
             self.message = f"Difficulty: {label} ({sims} sims)."
             return {"ok": True}
 
@@ -510,9 +546,8 @@ class GameServer:
                     self.difficulty_label = str(payload["difficulty_label"])
                 if "difficulty_sims" in payload:
                     self.difficulty_sims = int(payload["difficulty_sims"])
-                    if self.ai:
-                        self.ai.difficulty = self.difficulty_label
-                        self.ai.sims = self.difficulty_sims
+                    self.ai.difficulty = self.difficulty_label
+                    self.ai.sims = self.difficulty_sims
 
                 self.analysis_enabled = bool(
                     payload.get("analysis_enabled", False))
@@ -561,7 +596,7 @@ class GameServer:
 
     def _begin_ai_turn(self):
         """Start AI computation. Caller must hold self.lock."""
-        if self.ai is None or self.game_over:
+        if self.game_over:
             return
         self._ai_turn_gen += 1
         gen = self._ai_turn_gen
@@ -578,9 +613,6 @@ class GameServer:
                     return
                 game_copy = self.game.copy()
                 ai = self.ai
-                if ai is None:
-                    self.ai_thinking = False
-                    return
 
             row, col, val = ai.get_move(game_copy)
 
