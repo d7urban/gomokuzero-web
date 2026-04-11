@@ -153,6 +153,8 @@ let hover = null;
 
 let analysisTimer = null;
 let analysisGen = 0;    // invalidate stale analysis responses
+let analysisStep = 0;   // progressive deepening index
+const ANALYSIS_STEPS = [100, 250, 500, 1000, 2000, 5000];
 
 const canvas = document.getElementById('board');
 const ctx = canvas.getContext('2d');
@@ -304,28 +306,34 @@ function scheduleAnalysis() {
   if (!analysisEnabled || gameOver) return;
   if (!humanOnlyMode && currentPlayer !== humanPlayer) return;
   analysisData = null;
+  analysisStep = 0;
   analysisGen++;
   doAnalysis(analysisGen);
 }
 
 async function doAnalysis(gen) {
-  if (gen !== analysisGen) return;
-  if (!analysisEnabled || gameOver) return;
+  if (gen !== analysisGen || !analysisEnabled || gameOver) return;
+  const sims = ANALYSIS_STEPS[Math.min(analysisStep, ANALYSIS_STEPS.length - 1)];
+  const atMax = analysisStep >= ANALYSIS_STEPS.length - 1;
   const t0 = performance.now();
   try {
     const resp = await api('/api/analyze', {
       move_history: moveHistory,
-      sims: 500,
+      sims: sims,
     });
     if (gen !== analysisGen) return;
-    if (resp.error) return;
-    const elapsed = (performance.now() - t0) / 1000;
-    resp.sims_per_sec = elapsed > 0 ? Math.round(resp.sims_done / elapsed) : 0;
-    analysisData = resp;
-    updateUI(); draw();
-  } catch(e) { /* ignore */ }
-  if (gen === analysisGen && analysisEnabled && !gameOver) {
-    analysisTimer = setTimeout(() => doAnalysis(gen), 2000);
+    if (!resp.error) {
+      const elapsed = (performance.now() - t0) / 1000;
+      resp.sims_per_sec = elapsed > 0 ? Math.round(resp.sims_done / elapsed) : 0;
+      resp.running = !atMax;
+      analysisData = resp;
+      analysisStep++;
+      updateUI(); draw();
+    }
+  } catch(e) { /* retry on next tick */ }
+  // Always reschedule unless we've reached max depth or been invalidated.
+  if (gen === analysisGen && analysisEnabled && !gameOver && !atMax) {
+    analysisTimer = setTimeout(() => doAnalysis(gen), 500);
   }
 }
 
@@ -777,8 +785,9 @@ function updateUI() {
     $('st-sps').textContent = '-';
   } else if (analysisData) {
     const rq = analysisData.root_q;
-    $('st-analysis').textContent = `${analysisData.sims_done} sims, root ${rq >= 0 ? '+' : ''}${rq.toFixed(2)}`;
-    $('st-sps').textContent = analysisData.sims_per_sec > 0 ? analysisData.sims_per_sec : '-';
+    const tag = analysisData.running ? '' : ' (done)';
+    $('st-analysis').textContent = `${analysisData.sims_done} sims, root ${rq >= 0 ? '+' : ''}${rq.toFixed(2)}${tag}`;
+    $('st-sps').textContent = analysisData.running && analysisData.sims_per_sec > 0 ? analysisData.sims_per_sec : '-';
   } else {
     $('st-analysis').textContent = 'Starting...';
     $('st-sps').textContent = '-';
